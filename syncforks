@@ -1,0 +1,364 @@
+#!/bin/bash
+# synchronize your github forks' branches with upstreams
+#
+# command line arguments in detail:
+# 
+# -o/-y take lists (quoted or unquoted), for example:
+# $ syncforks -o "10 11 12 13"      # from 10:00 AM to 1:59 PM
+# $ syncforks -o "9 16"             # from 9:00 AM to 9:59 AM and from 4:00 PM to 4:59 PM
+# $ syncforks -o 9 10 11 12 13      # quotes are not required
+# $ syncforks -o {9..16}            # which means you can use shell brace expansion (9:00 AM to 4:59 PM)
+# $ syncforks -o {9..16} -y {0..5}  # 9-5 on weekdays only
+#
+# config file usage:
+#
+# $ cat >~/.syncforksrc <<EOF
+# heredoc> FORKUSER='natefoo'
+# heredoc> REPOS['galaxyproject/galaxy']='
+# heredoc>     dev
+# heredoc>     master
+# heredoc>     regex:^release_[[:digit:]]{2}\.[[:digit:]]{2}$
+# heredoc> '
+# heredoc> REPOS['galaxyproject/starforge']='
+# heredoc>     master
+# heredoc> '
+# heredoc> EOF
+# $ syncforks
+#
+# Additional .syncforksrc options:
+#
+# Go to sleep for $SLEEP seconds 
+# SLEEP=<seconds>
+#
+# Only sync between 9 and 5
+# HOURS=({9..5})
+#
+# Only sync on weekdays (0=Sunday)
+# DAYS=({1..5})
+#
+# Command line flags override .syncforksrc variables where applicable.
+#
+# TODO:
+#   - the unquoted command line syntax is silly, just parse ranges like 9-11,13-17
+#   - specify repos on command line
+#   - log message handling
+#   - can it be done with bare repos?
+set -e
+#set -xv
+USAGE='usage: syncforks -u <user> [options]
+    -c: config file (also: $SYNCFORKSRC)
+    -u: github username (optional if $FORKUSER is set in config file)
+    -h: print this help message
+    -f: force push if fork branch push is rejected
+    -s: run continuously, waking every -s seconds
+    -o: with `-s`, only sync during these hours
+    -y: with `-s`, only sync on these days (0=Sunday)
+see source for config file and argument syntax
+'
+
+NONINT_MSG='ERROR: invalid non-integer value for ${nonint_label}: ${nonint}'
+
+SYNCROOT="$HOME/.syncforks"
+: ${SYNCFORKSRC:="$HOME/.syncforksrc"}
+
+DAYS=({0..6})
+HOURS=({0..23})
+SLEEP=-1
+FORKUSER=
+FORCEPUSH=
+typeset -A REPOS FLAGS
+
+branches=()
+
+function checkvar() {
+    [ -z "${!1}" ] && { echo "ERROR: required variable \$$1 not set in ${2}()!"; return 1; }
+    return 0
+}
+
+function checkarr() {
+    # requires bash >= 4.3
+    typeset -n t="$1"
+    [ "${#t[@]}" -gt 0 ] || { echo "ERROR: required array variable \$$1 is empty"; return 1; }
+}
+
+function rungit() {
+    local printgit=1
+    local patharg="-C $SYNCROOT/$repo"
+    local rc=0
+    case "$1" in
+        clone)
+            patharg=""
+            ;;
+        diff|branch)
+            printgit=
+            ;;
+    esac
+    [ -n "$patharg" ] && checkvar repo rungit || exit 1
+    [ -n "$printgit" ] && set -x
+    git $patharg "$@" || rc=$?
+    { set +x; } 2>/dev/null
+    return $rc
+}
+
+function isintorempty() {
+    # if the value referenced by the var *name* passed in $1 is:
+    #   an integer: return 0
+    #   empty: return 1
+    #   not an integer: return 2
+    [ -n "${!1}" ] || return 1
+    [ "${!1}" -eq "${!1}" ] 2>/dev/null || { rc=$?; [ $rc -ne 2 ] || { echo "ERROR: invalid non-integer value for ${2:-"\$$1"}: ${!1}"; }; return $rc; }
+    return 0
+}
+
+function isint() {
+    if isintorempty $1 $2; then
+        return 0
+    else
+        [ $? -ne 1 ] || echo "ERROR: ${2:-"\$$1"} value cannot be empty string"
+        return 1
+    fi
+}
+
+function issetone() {
+    # if the value referenced by the var *name* passed in $1 is:
+    #   the integer 1: return 0
+    #   any other integer: return 1
+    #   anything else: does what isint() does
+    isintorempty $1 && [ "${!1}" -eq "1" ]
+    return $?
+}
+
+# FIXME: don't need this anymore
+function mergeopts() {
+    # ${FLAGS[NAME]:-${DEFAULT}} always substitutes the value of $DEFAULT for some reason
+    for opt in "$@"; do
+        [ -z "${FLAGS[$opt]}" ] || eval ${opt}="${FLAGS[$opt]}"
+    done
+}
+
+function arrayopts() {
+    # handles quoted "array" option arguments and consumes any additional unquoted arguments until the next option.
+    # call from w/in the getopts loop.
+    return=
+    typeset -n t="$1"
+    shift
+    t=()
+    for val in $OPTARG; do
+        # handles quoted value for -d
+        isint val '-d' || return=2
+        t+=($val)
+    done
+    shift $((OPTIND-1))
+    while [ -n "$1" -a "${1:0:1}" != '-' ]; do
+        val="$1"
+        isint val '-d' || return=2
+        t+=("$val")
+        shift
+    done
+    [ -z "$return" ] || return $return
+    # recursively call setopts on new args
+    OPTIND=1
+    setopts "$@"
+}
+
+function configopt() {
+    while getopts ":c:" opt; do
+        [ "$opt" = "c" ] && SYNCFORKSRC="$OPTARG" || true
+    done
+    OPTIND=1
+}
+
+function setopts() {
+    local opts=':c:fho:r:s:t:u:y:'
+    local exit=
+    while getopts "$opts" opt; do
+        case $opt in
+            #c)
+            #    : # already got this
+            #    ;;
+            h)
+                echo "$USAGE"
+                exit 0
+                ;;
+            f)
+                #FLAGS[FORCEPUSH]=1
+                FORCEPUSH=1
+                ;;
+            s)
+                # maybe some day make the empty string explicitly disable sleep (but probably just better to pass -1)
+                isint OPTARG '-s' || exit=2
+                #FLAGS[SLEEP]="$OPTARG"
+                SLEEP="$OPTARG"
+                ;;
+            o)
+                arrayopts HOURS "$@" || exit=2
+                [ -z "$exit" ] || exit $exit
+                return  # arraopts recurses
+                ;;
+            r)
+                echo "got -r: $OPTARG"
+                ;;
+            y)
+                arrayopts DAYS "$@" || exit=2
+                [ -z "$exit" ] || exit $exit
+                return
+                ;;
+            u)
+                FORKUSER="$OPTARG"
+                ;;
+            :)
+                echo "ERROR: missing option argument for -$OPTARG"
+                exit=2
+                ;;
+            \?)
+                echo "ERROR: invalid option: -$OPTARG"
+                echo "$USAGE"
+                exit=2
+                ;;
+        esac
+    done
+    [ -z "$exit" ] || exit $exit
+}
+
+function readrc() {
+    local exit=
+    [ ! -f "$SYNCFORKSRC" ] && { echo "ERROR: configure repos in ${SYNCFORKSRC}"; exit 2; }
+    . "${SYNCFORKSRC}"
+    # check stuff required in rc
+    checkarr REPOS readrc || exit=2
+    isintorempty FORCEPUSH || [ $? -ne 2 ] || exit=2
+    [ -z "$exit" ] || exit $exit
+}
+
+function config()
+{
+    local exit=
+    checkvar FORKUSER readrc || exit=2
+    for fullrepo in "${!REPOS[@]}"; do
+        repo="${fullrepo#*/}"
+        [ -z "$repo" -o "$repo" == "$fullrepo" ] && { echo "ERROR: invalid repo '$fullrepo', format is 'owner/repo'"; exit=2; }
+    done
+    #mergeopts SLEEP FORCEPUSH
+    # can't indicate intentional forcepush=0 with -f, only "yes, force" or "use the default"
+    if issetone FORCEPUSH; then
+        FORCEPUSH='+'
+    else
+        # shouldn't be possible for it to be non-int at this point, but just to be safe...
+        [ $? -ne 2 ] && FORCEPUSH= || exit=2
+    fi
+    [ -z "$exit" ] || exit $exit
+    if [ -n "$DEBUG" ]; then
+        echo "Global Options"
+        echo "--------------"
+        for name in FORKUSER FORCEPUSH SLEEP; do
+            echo "$name: ${!name}"
+        done
+        for name in DAYS HOURS; do
+            typeset -n t="$name"
+            echo "$name: ${t[@]}"
+        done
+        echo ""
+        echo "Configured Repositories"
+        echo "-----------------------"
+        for i in ${!REPOS[@]}; do
+            echo "$i: ${REPOS[$i]}"
+        done
+        exit 0
+    fi
+}
+
+function setup() {
+    checkvar repo setup
+    checkvar fullrepo setup
+    if [ ! -d "$SYNCROOT/$repo" ]; then
+        [ ! -d "$SYNCROOT" ] && mkdir -p "$SYNCROOT"
+        rungit clone "https://github.com/$fullrepo" "$SYNCROOT/$repo"
+        rungit remote add $FORKUSER git@github.com:$FORKUSER/${repo}.git
+    fi
+}
+
+function fetch() {
+    # will check $repo in rungit
+    rungit fetch --prune origin
+    rungit fetch --prune $FORKUSER
+}
+
+function branchlist() {
+    checkvar repo branches
+    checkvar fullrepo branches
+    branches=()
+    for branch in ${REPOS[$fullrepo]}; do
+        case $branch in
+            regex:*)
+                branches+=($(rungit branch -r --color=never | sed 's/^\s*//' | awk -F/ "\$1 == \"origin\" && \$2 ~ /${branch#regex:}/ {print \$2}"))
+                ;;
+            *)
+                branches+=($branch)
+                ;;
+        esac
+    done
+    if [ "${#branches[@]}" -eq 0 ]; then
+        echo "WARNING: branch list for $repo is empty, all branches will be synchronized"
+        branches=($(rungit branch -r --color=never | sed 's/^\s*//' | awk -F/ "\$1 == \"origin\" && \$2 !~ /HEAD/ {print \$2}"))
+    fi
+}
+
+function push() {
+    # only attempts to push branches that have changed
+    checkvar repo push
+    checkvar branch push
+    # even with --quiet it'll output an error if the branch doesn't exist on the user remote
+    if ! rungit diff --quiet origin/${branch} $FORKUSER/${branch} 2>/dev/null; then
+        rungit push $FORKUSER ${FORCEPUSH}refs/remotes/origin/${branch}:refs/heads/${branch}
+    fi
+}
+
+function sync() {
+    for fullrepo in "${!REPOS[@]}"; do
+        owner="${fullrepo%/*}"
+        repo="${fullrepo#*/}"
+        fetch
+        branchlist
+        for branch in "${branches[@]}"; do
+            push branch
+        done
+    done
+}
+
+function intinarray() {
+    local key=$1
+    local -n array="$2"
+    local member
+    for member in "${array[@]}"; do
+        [ "$member" -eq "$key" ] && return 0
+    done
+    return 1
+}
+
+
+configopt "$@"
+readrc
+setopts "$@"
+config
+
+for fullrepo in "${!REPOS[@]}"; do
+    owner="${fullrepo%/*}"
+    repo="${fullrepo#*/}"
+    setup
+done
+
+sync
+
+if [ "$SLEEP" -gt 0 ]; then
+    while true; do
+        echo "Going to sleep for $SLEEP seconds"
+        sleep $SLEEP
+        echo "Waking up at $(date)"
+        read day hour < <(date '+%w %H')
+        if intinarray $day DAYS && intinarray $hour HOURS; then
+            sync
+        else
+            echo "Not in sync period"
+        fi
+    done
+fi
