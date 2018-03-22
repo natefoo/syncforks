@@ -93,7 +93,9 @@ function rungit() {
             printgit=
             ;;
     esac
-    [ -n "$patharg" ] && checkvar repo rungit || exit 1
+    if [ -n "$patharg" ]; then
+        checkvar repo rungit || exit 1
+    fi
     [ -n "$printgit" ] && set -x
     git $patharg "$@" || rc=$?
     { set +x; } 2>/dev/null
